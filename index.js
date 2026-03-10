@@ -1109,6 +1109,18 @@ function createGeneratedMediaElement(result, tag) {
     return img;
 }
 
+function buildPersistedVideoTag(templateHtml, persistedSrc, posterSrc = '') {
+    let html = templateHtml
+        .replace(/^<img\b/i, '<video controls autoplay loop muted playsinline')
+        .replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${persistedSrc}"`)
+        .replace(/\/?>\s*$/i, '></video>');
+    html = html.replace(/\s+poster\s*=\s*(['"])[\s\S]*?\1/i, '');
+    if (posterSrc) {
+        html = html.replace(/^<video\b/i, `<video poster="${sanitizeForHtml(posterSrc)}"`);
+    }
+    return html;
+}
+
 /**
  * Generate image with retry logic
  * @param {string} prompt - Image description
@@ -1773,6 +1785,7 @@ async function processMessageTags(messageId) {
             );
 
             let persistedSrc = '';
+            let persistedPosterSrc = '';
             if (isGeneratedVideoResult(generated)) {
                 statusEl.textContent = 'Сохранение видео...';
                 persistedSrc = await saveNaisteraMediaToFile(generated.dataUrl, 'video', {
@@ -1781,6 +1794,15 @@ async function processMessageTags(messageId) {
                     mode: 'generate-video',
                     apiType: getSettings().apiType,
                 });
+                if (generated.posterDataUrl) {
+                    statusEl.textContent = 'Сохранение превью...';
+                    persistedPosterSrc = await saveImageToFile(generated.posterDataUrl, {
+                        messageId,
+                        tagIndex: index,
+                        mode: 'generate-video-poster',
+                        apiType: getSettings().apiType,
+                    });
+                }
             } else {
                 statusEl.textContent = 'Сохранение...';
                 persistedSrc = await saveImageToFile(generated, {
@@ -1792,7 +1814,9 @@ async function processMessageTags(messageId) {
             }
 
             const mediaElement = createGeneratedMediaElement(
-                isGeneratedVideoResult(generated) ? { ...generated, dataUrl: persistedSrc } : persistedSrc,
+                isGeneratedVideoResult(generated)
+                    ? { ...generated, dataUrl: persistedSrc, posterDataUrl: persistedPosterSrc || generated.posterDataUrl || '' }
+                    : persistedSrc,
                 tag,
             );
 
@@ -1807,14 +1831,8 @@ async function processMessageTags(messageId) {
             loadingPlaceholder.replaceWith(mediaElement);
 
             if (tag.isNewFormat) {
-                const srcAttr = isGeneratedVideoResult(generated)
-                    ? `poster="${sanitizeForHtml(generated.posterDataUrl || '')}" src="${persistedSrc}"`
-                    : `src="${persistedSrc}"`;
                 const updatedTag = isGeneratedVideoResult(generated)
-                    ? tag.fullMatch
-                        .replace(/^<img\b/i, '<video controls autoplay loop muted playsinline')
-                        .replace(/src\s*=\s*(['"])[^'"]*\1/i, srcAttr)
-                        .replace(/\/?>\s*$/i, '></video>')
+                    ? buildPersistedVideoTag(tag.fullMatch, persistedSrc, persistedPosterSrc)
                     : tag.fullMatch.replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${persistedSrc}"`);
                 replaceTagInMessageSource(message, tag, updatedTag);
             } else {
@@ -1950,6 +1968,7 @@ async function regenerateMessageImages(messageId) {
                 );
 
                 let persistedSrc = '';
+                let persistedPosterSrc = '';
                 if (isGeneratedVideoResult(generated)) {
                     statusEl.textContent = 'Сохранение видео...';
                     persistedSrc = await saveNaisteraMediaToFile(generated.dataUrl, 'video', {
@@ -1958,6 +1977,15 @@ async function regenerateMessageImages(messageId) {
                         mode: 'regenerate-video',
                         apiType: getSettings().apiType,
                     });
+                    if (generated.posterDataUrl) {
+                        statusEl.textContent = 'Сохранение превью...';
+                        persistedPosterSrc = await saveImageToFile(generated.posterDataUrl, {
+                            messageId,
+                            tagIndex: index,
+                            mode: 'regenerate-video-poster',
+                            apiType: getSettings().apiType,
+                        });
+                    }
                 } else {
                     statusEl.textContent = 'Сохранение...';
                     persistedSrc = await saveImageToFile(generated, {
@@ -1969,7 +1997,9 @@ async function regenerateMessageImages(messageId) {
                 }
 
                 const mediaElement = createGeneratedMediaElement(
-                    isGeneratedVideoResult(generated) ? { ...generated, dataUrl: persistedSrc } : persistedSrc,
+                    isGeneratedVideoResult(generated)
+                        ? { ...generated, dataUrl: persistedSrc, posterDataUrl: persistedPosterSrc || generated.posterDataUrl || '' }
+                        : persistedSrc,
                     tag,
                 );
                 if (instruction) {
@@ -1979,10 +2009,7 @@ async function regenerateMessageImages(messageId) {
                 
                 // Update message.mes
                 const updatedTag = isGeneratedVideoResult(generated)
-                    ? tag.fullMatch
-                        .replace(/^<img\b/i, '<video controls autoplay loop muted playsinline')
-                        .replace(/src\s*=\s*(['"])[^'"]*\1/i, `poster="${sanitizeForHtml(generated.posterDataUrl || '')}" src="${persistedSrc}"`)
-                        .replace(/\/?>\s*$/i, '></video>')
+                    ? buildPersistedVideoTag(tag.fullMatch, persistedSrc, persistedPosterSrc)
                     : tag.fullMatch.replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${persistedSrc}"`);
                 replaceTagInMessageSource(message, tag, updatedTag);
                 
