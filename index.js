@@ -1321,6 +1321,53 @@ function buildPendingLegacyTag(tag) {
     return `<img data-iig-instruction='${instruction}' src="[IMG:GEN]">`;
 }
 
+function buildPersistedImageTag(tag, persistedSrc) {
+    const templateHtml = tag?.isNewFormat ? tag.fullMatch : buildPendingLegacyTag(tag);
+    return String(templateHtml || '').replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${persistedSrc}"`);
+}
+
+function buildPersistedMediaTag(tag, generated, persistedSrc, posterSrc = '') {
+    return isGeneratedVideoResult(generated)
+        ? buildPersistedVideoTag(tag?.fullMatch, persistedSrc, posterSrc)
+        : buildPersistedImageTag(tag, persistedSrc);
+}
+
+function convertLegacyTagsToInstructionFormat(message, tags) {
+    let convertedLegacyTags = 0;
+
+    for (const tag of tags) {
+        if (tag.isNewFormat) {
+            continue;
+        }
+
+        const pendingTag = buildPendingLegacyTag(tag);
+        replaceTagInMessageSource(message, tag, pendingTag);
+        tag.fullMatch = pendingTag;
+        tag.isNewFormat = true;
+        convertedLegacyTags += 1;
+    }
+
+    return convertedLegacyTags;
+}
+
+function rerenderMessageHtml(context, message, settings, messageId, mesTextEl) {
+    if (!mesTextEl) {
+        return;
+    }
+
+    const formattedMessage = typeof context.messageFormatting === 'function'
+        ? context.messageFormatting(
+            getMessageRenderText(message, settings),
+            message.name,
+            message.is_system,
+            message.is_user,
+            messageId
+        )
+        : getMessageRenderText(message, settings);
+
+    mesTextEl.innerHTML = formattedMessage;
+}
+
 /**
  * Generate image with retry logic
  * @param {string} prompt - Image description
@@ -1828,30 +1875,10 @@ async function processMessageTags(messageId) {
     const mesTextEl = messageElement.querySelector('.mes_text');
     if (!mesTextEl) return;
 
-    let convertedLegacyTags = 0;
-    for (const tag of tags) {
-        if (tag.isNewFormat) {
-            continue;
-        }
-
-        const pendingTag = buildPendingLegacyTag(tag);
-        replaceTagInMessageSource(message, tag, pendingTag);
-        tag.fullMatch = pendingTag;
-        tag.isNewFormat = true;
-        convertedLegacyTags += 1;
-    }
+    const convertedLegacyTags = convertLegacyTagsToInstructionFormat(message, tags);
 
     if (convertedLegacyTags > 0) {
-        const formattedMessage = typeof context.messageFormatting === 'function'
-            ? context.messageFormatting(
-                getMessageRenderText(message, settings),
-                message.name,
-                message.is_system,
-                message.is_user,
-                messageId
-            )
-            : getMessageRenderText(message, settings);
-        mesTextEl.innerHTML = formattedMessage;
+        rerenderMessageHtml(context, message, settings, messageId, mesTextEl);
         iigLog('INFO', `Converted ${convertedLegacyTags} legacy tag(s) to instruction tags before processing`);
     }
     
@@ -2025,9 +2052,7 @@ async function processMessageTags(messageId) {
 
             loadingPlaceholder.replaceWith(mediaElement);
 
-            const updatedTag = isGeneratedVideoResult(generated)
-                ? buildPersistedVideoTag(tag.fullMatch, persistedSrc, persistedPosterSrc)
-                : tag.fullMatch.replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${persistedSrc}"`);
+            const updatedTag = buildPersistedMediaTag(tag, generated, persistedSrc, persistedPosterSrc);
             replaceTagInMessageSource(message, tag, updatedTag);
 
             iigLog('INFO', `Successfully generated ${isGeneratedVideoResult(generated) ? 'video' : 'image'} for tag ${index}`);
@@ -2074,14 +2099,7 @@ async function processMessageTags(messageId) {
     // Force re-render the message to show updated content
     // Use SillyTavern's messageFormatting if available
     if (typeof context.messageFormatting === 'function') {
-        const formattedMessage = context.messageFormatting(
-            getMessageRenderText(message, settings),
-            message.name,
-            message.is_system,
-            message.is_user,
-            messageId
-        );
-        mesTextEl.innerHTML = formattedMessage;
+        rerenderMessageHtml(context, message, settings, messageId, mesTextEl);
         console.log('[IIG] Message re-rendered via messageFormatting');
     } else {
         // Fallback: trigger a manual re-render by finding and updating the element
@@ -2099,6 +2117,7 @@ async function processMessageTags(messageId) {
  */
 async function regenerateMessageImages(messageId) {
     const context = SillyTavern.getContext();
+    const settings = getSettings();
     const message = context.chat[messageId];
     
     if (!message) {
@@ -2130,6 +2149,12 @@ async function regenerateMessageImages(messageId) {
     if (!mesTextEl) {
         processingMessages.delete(messageId);
         return;
+    }
+
+    const convertedLegacyTags = convertLegacyTagsToInstructionFormat(message, tags);
+    if (convertedLegacyTags > 0) {
+        rerenderMessageHtml(context, message, settings, messageId, mesTextEl);
+        iigLog('INFO', `Converted ${convertedLegacyTags} legacy tag(s) to instruction tags before regeneration`);
     }
     
     for (let index = 0; index < tags.length; index++) {
@@ -2199,9 +2224,7 @@ async function regenerateMessageImages(messageId) {
                 loadingPlaceholder.replaceWith(mediaElement);
                 
                 // Update message.mes
-                const updatedTag = isGeneratedVideoResult(generated)
-                    ? buildPersistedVideoTag(tag.fullMatch, persistedSrc, persistedPosterSrc)
-                    : tag.fullMatch.replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${persistedSrc}"`);
+                const updatedTag = buildPersistedMediaTag(tag, generated, persistedSrc, persistedPosterSrc);
                 replaceTagInMessageSource(message, tag, updatedTag);
                 
                 toastr.success(
@@ -2218,6 +2241,7 @@ async function regenerateMessageImages(messageId) {
     
     processingMessages.delete(messageId);
     await context.saveChat();
+    rerenderMessageHtml(context, message, settings, messageId, mesTextEl);
     iigLog('INFO', `Regeneration complete for message ${messageId}`);
 }
 
