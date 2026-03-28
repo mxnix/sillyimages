@@ -1050,14 +1050,18 @@ async function generateImageNaistera(prompt, style, options = {}) {
     const endpoint = getEffectiveEndpoint(settings);
     const url = endpoint.endsWith('/api/generate') ? endpoint : `${endpoint}/api/generate`;
 
-    const fullPrompt = style ? `[Style: ${style}] ${prompt}` : prompt;
-
     const aspectRatio = options.aspectRatio || settings.naisteraAspectRatio || '1:1';
     const model = normalizeNaisteraModel(options.model || settings.naisteraModel || 'grok');
     const preset = options.preset || null;
     const referenceImages = options.referenceImages || [];
     const wantsVideoTest = Boolean(options.videoTestMode);
     const videoEveryN = normalizeNaisteraVideoFrequency(options.videoEveryN ?? settings.naisteraVideoEveryN);
+    let fullPrompt = style ? `[Style: ${style}] ${prompt}` : prompt;
+
+    if (referenceImages.length > 0) {
+        const refInstruction = `[CRITICAL: The reference image(s) above show the EXACT appearance of the character(s). You MUST precisely copy their: face structure, eye color, hair color and style, skin tone, body type, clothing, and all distinctive features. Do not deviate from the reference appearances.]`;
+        fullPrompt = `${refInstruction}\n\n${fullPrompt}`;
+    }
 
     const body = {
         prompt: fullPrompt,
