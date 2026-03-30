@@ -73,10 +73,12 @@ const defaultSettings = Object.freeze({
     naisteraSendUserAvatar: false,
     naisteraVideoTest: false,
     naisteraVideoEveryN: 1,
+    additionalReferences: [],
 });
 
 const MAX_CONTEXT_IMAGES = 3;
 const MAX_GENERATION_REFERENCE_IMAGES = 5;
+const MAX_ADDITIONAL_REFERENCES = 8;
 const PERSONAS_MODULE_PATHS = Object.freeze([
     '/scripts/personas.js',
     '../../../personas.js',
@@ -250,6 +252,22 @@ function saveSettings() {
     context.saveSettingsDebounced();
 }
 
+function ensureAdditionalReferencesArray(settings = getSettings()) {
+    if (!Array.isArray(settings.additionalReferences)) {
+        settings.additionalReferences = [];
+    }
+
+    settings.additionalReferences = settings.additionalReferences
+        .slice(0, MAX_ADDITIONAL_REFERENCES)
+        .map((ref) => ({
+            name: String(ref?.name || '').trim(),
+            imagePath: String(ref?.imagePath || '').trim(),
+            matchMode: ref?.matchMode === 'always' ? 'always' : 'match',
+        }));
+
+    return settings.additionalReferences;
+}
+
 function getMessageRenderText(message, settings = getSettings()) {
     if (!message) return '';
     if (settings.externalBlocks && message.extra?.display_text) {
@@ -337,6 +355,151 @@ function extractGeneratedImageUrlsFromText(text) {
     }
 
     return urls;
+}
+
+function normalizeStoredImagePath(path) {
+    const raw = String(path || '').trim();
+    if (!raw) return '';
+    if (raw.startsWith('data:')) return raw;
+    if (/^(?:https?:)?\/\//i.test(raw)) return raw;
+    return raw.startsWith('/') ? raw : `/${raw.replace(/^\/+/, '')}`;
+}
+
+function escapeRegex(text) {
+    return String(text || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function normalizeReferenceTriggerText(text) {
+    return String(text || '')
+        .normalize('NFKC')
+        .toLowerCase()
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function promptContainsReferenceName(prompt, name) {
+    const normalizedPrompt = normalizeReferenceTriggerText(prompt);
+    const normalizedName = normalizeReferenceTriggerText(name);
+
+    if (!normalizedPrompt || !normalizedName) {
+        return false;
+    }
+
+    const pattern = escapeRegex(normalizedName).replace(/\s+/g, '\\s+');
+    try {
+        const regex = new RegExp(`(^|[^\\p{L}\\p{N}_])${pattern}(?=$|[^\\p{L}\\p{N}_])`, 'iu');
+        return regex.test(normalizedPrompt);
+    } catch (_error) {
+        return normalizedPrompt.includes(normalizedName);
+    }
+}
+
+function parseReferenceAliases(name) {
+    return String(name || '')
+        .split(',')
+        .map((alias) => normalizeReferenceTriggerText(alias))
+        .filter(Boolean);
+}
+
+function getMatchedAdditionalReferences(prompt) {
+    const refs = ensureAdditionalReferencesArray()
+        .map((ref) => ({
+            name: String(ref?.name || '').trim(),
+            imagePath: normalizeStoredImagePath(ref?.imagePath || ''),
+            matchMode: ref?.matchMode === 'always' ? 'always' : 'match',
+        }))
+        .filter((ref) => ref.name && ref.imagePath);
+
+    const matched = [];
+    const seenKeys = new Set();
+
+    for (const ref of refs) {
+        const aliases = parseReferenceAliases(ref.name);
+        const isMatched = ref.matchMode === 'always'
+            || aliases.some((alias) => promptContainsReferenceName(prompt, alias));
+
+        if (!isMatched) {
+            continue;
+        }
+
+        const dedupeKey = `${ref.name}::${ref.imagePath}`;
+        if (seenKeys.has(dedupeKey)) {
+            continue;
+        }
+
+        seenKeys.add(dedupeKey);
+        matched.push(ref);
+    }
+
+    return matched;
+}
+
+function buildAdditionalReferenceRowsHtml(settings = getSettings()) {
+    const refs = ensureAdditionalReferencesArray(settings);
+
+    if (refs.length === 0) {
+        return '<p class="hint">Пока пусто. Добавь референс с именем-триггером и картинкой.</p>';
+    }
+
+    return refs.map((ref, index) => {
+        const previewSrc = normalizeStoredImagePath(ref.imagePath);
+        const isAlways = ref.matchMode === 'always';
+        const previewHtml = previewSrc
+            ? `<img src="${sanitizeForHtml(previewSrc)}" alt="${sanitizeForHtml(ref.name || `ref-${index + 1}`)}" style="width:56px;height:56px;object-fit:cover;border-radius:8px;border:1px solid var(--SmartThemeBorderColor, #555);">`
+            : '<div style="width:56px;height:56px;border-radius:8px;border:1px dashed var(--SmartThemeBorderColor, #555);display:flex;align-items:center;justify-content:center;font-size:11px;opacity:.7;">нет</div>';
+
+        return `
+            <div class="iig-additional-ref-row" data-ref-index="${index}" style="display:flex;gap:8px;align-items:center;margin-top:8px;">
+                <div class="iig-additional-ref-preview">${previewHtml}</div>
+                <div class="flex1" style="display:flex;flex-direction:column;gap:6px;">
+                    <input
+                        type="text"
+                        class="text_pole flex1 iig-additional-ref-name"
+                        placeholder="Алиасы через запятую, например Alice, Алиса"
+                        value="${sanitizeForHtml(ref.name || '')}"
+                    >
+                    <label class="checkbox_label" style="margin:0;">
+                        <input type="checkbox" class="iig-additional-ref-always" ${isAlways ? 'checked' : ''}>
+                        <span>${isAlways ? 'Отправлять всегда' : 'Отправлять по совпадению'}</span>
+                    </label>
+                </div>
+                <label class="menu_button" title="Загрузить картинку" style="display:flex;align-items:center;justify-content:center;">
+                    <i class="fa-solid fa-upload"></i>
+                    <input type="file" accept="image/*" class="iig-additional-ref-file" style="display:none">
+                </label>
+                <div class="menu_button iig-additional-ref-remove" title="Удалить">
+                    <i class="fa-solid fa-trash"></i>
+                </div>
+            </div>
+        `;
+    }).join('');
+}
+
+function renderAdditionalReferencesList() {
+    const container = document.getElementById('iig_additional_refs_list');
+    if (!container) {
+        return;
+    }
+
+    container.innerHTML = buildAdditionalReferenceRowsHtml();
+
+    const status = document.getElementById('iig_additional_refs_status');
+    if (status) {
+        const refs = ensureAdditionalReferencesArray().filter((ref) => String(ref?.name || '').trim() && String(ref?.imagePath || '').trim());
+        const alwaysCount = refs.filter((ref) => ref.matchMode === 'always').length;
+        status.textContent = refs.length > 0
+            ? `Активных доп. референсов: ${refs.length}. Всегда отправляются: ${alwaysCount}.`
+            : '';
+    }
+}
+
+async function readFileAsDataUrl(file) {
+    return await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(String(reader.result || ''));
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+    });
 }
 
 function getPreviousGeneratedImageUrls(messageId, requestedCount) {
@@ -1487,6 +1650,39 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
         }
     }
 
+    const matchedAdditionalRefs = getMatchedAdditionalReferences(prompt);
+    if (matchedAdditionalRefs.length > 0) {
+        iigLog(
+            'INFO',
+            `Matched additional refs: ${matchedAdditionalRefs.map((ref) => `${ref.name} [${ref.matchMode}]`).join(', ')}`
+        );
+    }
+
+    for (const ref of matchedAdditionalRefs) {
+        if (referenceImages.length >= MAX_GENERATION_REFERENCE_IMAGES && referenceDataUrls.length >= MAX_GENERATION_REFERENCE_IMAGES) {
+            break;
+        }
+
+        const imagePath = normalizeStoredImagePath(ref.imagePath);
+        if (!imagePath) {
+            continue;
+        }
+
+        if ((settings.apiType === 'gemini' || isGeminiModel(settings.model)) && referenceImages.length < MAX_GENERATION_REFERENCE_IMAGES) {
+            const b64 = await imageUrlToBase64(imagePath);
+            if (b64) {
+                referenceImages.push(b64);
+            }
+        }
+
+        if (settings.apiType === 'naistera' && referenceDataUrls.length < MAX_GENERATION_REFERENCE_IMAGES) {
+            const dataUrl = await imageUrlToDataUrl(imagePath);
+            if (dataUrl) {
+                referenceDataUrls.push(dataUrl);
+            }
+        }
+    }
+
     if (settings.imageContextEnabled) {
         const contextCount = normalizeImageContextCount(settings.imageContextCount);
         if (settings.apiType === 'gemini' || isGeminiModel(settings.model)) {
@@ -2621,6 +2817,18 @@ function createSettingsUI() {
                         </div>
                     </div>
 
+                    <div class="iig-settings-card ${['naistera', 'gemini'].includes(settings.apiType) ? '' : 'iig-hidden'}" id="iig_additional_refs_section">
+                        <h4>Дополнительные референсы</h4>
+                        <p class="hint">Референс можно отправлять всегда или по совпадению. Референсу можно указать несколько имён через запятую. </p>
+                        <div id="iig_additional_refs_status" class="hint" style="margin-bottom: 8px;"></div>
+                        <div id="iig_additional_refs_list"></div>
+                        <div class="flex-row" style="margin-top: 8px;">
+                            <div id="iig_additional_refs_add" class="menu_button" style="width: 100%;">
+                                <i class="fa-solid fa-plus" style="margin-right: 6px;"></i>Добавить референс
+                            </div>
+                        </div>
+                    </div>
+
                     <div class="iig-settings-card ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}" id="iig_naistera_video_section">
                         <h4>Видео</h4>
                         <label class="checkbox_label">
@@ -2697,6 +2905,7 @@ function bindSettingsEvents() {
         document.getElementById('iig_model_row')?.classList.toggle('iig-hidden', isNaistera);
         document.getElementById('iig_image_context_section')?.classList.toggle('iig-hidden', !(isNaistera || isGemini));
         document.getElementById('iig_image_context_count_row')?.classList.toggle('iig-hidden', !((isNaistera || isGemini) && settings.imageContextEnabled));
+        document.getElementById('iig_additional_refs_section')?.classList.toggle('iig-hidden', !(isNaistera || isGemini));
 
         // OpenAI-only params
         document.getElementById('iig_size_row')?.classList.toggle('iig-hidden', !isOpenAI);
@@ -2981,6 +3190,129 @@ function bindSettingsEvents() {
             btn.classList.remove('loading');
         }
     });
+
+    document.getElementById('iig_additional_refs_add')?.addEventListener('click', () => {
+        const refs = ensureAdditionalReferencesArray(settings);
+        if (refs.length >= MAX_ADDITIONAL_REFERENCES) {
+            toastr.warning(`Максимум дополнительных референсов: ${MAX_ADDITIONAL_REFERENCES}`, 'Генерация картинок');
+            return;
+        }
+
+        refs.push({ name: '', imagePath: '', matchMode: 'match' });
+        saveSettings();
+        renderAdditionalReferencesList();
+    });
+
+    document.getElementById('iig_additional_refs_list')?.addEventListener('input', (e) => {
+        const target = e.target;
+        if (!(target instanceof HTMLInputElement) || !target.classList.contains('iig-additional-ref-name')) {
+            return;
+        }
+
+        const row = target.closest('.iig-additional-ref-row');
+        const index = Number.parseInt(String(row?.getAttribute('data-ref-index') || ''), 10);
+        if (!Number.isInteger(index)) {
+            return;
+        }
+
+        const refs = ensureAdditionalReferencesArray(settings);
+        if (!refs[index]) {
+            return;
+        }
+
+        refs[index].name = target.value;
+        saveSettings();
+    });
+
+    document.getElementById('iig_additional_refs_list')?.addEventListener('change', async (e) => {
+        const target = e.target;
+        if (!(target instanceof HTMLInputElement) || !target.classList.contains('iig-additional-ref-file')) {
+            return;
+        }
+
+        const row = target.closest('.iig-additional-ref-row');
+        const index = Number.parseInt(String(row?.getAttribute('data-ref-index') || ''), 10);
+        if (!Number.isInteger(index)) {
+            target.value = '';
+            return;
+        }
+
+        const file = target.files?.[0];
+        if (!file) {
+            target.value = '';
+            return;
+        }
+
+        const refs = ensureAdditionalReferencesArray(settings);
+        if (!refs[index]) {
+            target.value = '';
+            return;
+        }
+
+        try {
+            if (!refs[index].name) {
+                refs[index].name = file.name.replace(/\.[^.]+$/, '');
+            }
+
+            const dataUrl = await readFileAsDataUrl(file);
+            const savedPath = await saveImageToFile(dataUrl, {
+                mode: 'additional-reference-upload',
+                refIndex: index,
+                refName: refs[index].name,
+            });
+
+            refs[index].imagePath = normalizeStoredImagePath(savedPath);
+            saveSettings();
+            renderAdditionalReferencesList();
+            toastr.success('Дополнительный референс сохранён', 'Генерация картинок');
+        } catch (error) {
+            console.error('[IIG] Failed to upload additional reference:', error);
+            toastr.error(`Ошибка загрузки референса: ${error.message || error}`, 'Генерация картинок');
+        } finally {
+            target.value = '';
+        }
+    });
+
+    document.getElementById('iig_additional_refs_list')?.addEventListener('change', (e) => {
+        const target = e.target;
+        if (!(target instanceof HTMLInputElement) || !target.classList.contains('iig-additional-ref-always')) {
+            return;
+        }
+
+        const row = target.closest('.iig-additional-ref-row');
+        const index = Number.parseInt(String(row?.getAttribute('data-ref-index') || ''), 10);
+        if (!Number.isInteger(index)) {
+            return;
+        }
+
+        const refs = ensureAdditionalReferencesArray(settings);
+        if (!refs[index]) {
+            return;
+        }
+
+        refs[index].matchMode = target.checked ? 'always' : 'match';
+        saveSettings();
+        renderAdditionalReferencesList();
+    });
+
+    document.getElementById('iig_additional_refs_list')?.addEventListener('click', (e) => {
+        const target = e.target;
+        const button = target instanceof Element ? target.closest('.iig-additional-ref-remove') : null;
+        if (!button) {
+            return;
+        }
+
+        const row = button.closest('.iig-additional-ref-row');
+        const index = Number.parseInt(String(row?.getAttribute('data-ref-index') || ''), 10);
+        if (!Number.isInteger(index)) {
+            return;
+        }
+
+        const refs = ensureAdditionalReferencesArray(settings);
+        refs.splice(index, 1);
+        saveSettings();
+        renderAdditionalReferencesList();
+    });
     
     // Max retries
     document.getElementById('iig_max_retries')?.addEventListener('input', (e) => {
@@ -3002,6 +3334,7 @@ function bindSettingsEvents() {
     // Apply initial state
     syncUserAvatarSelection(settings.userAvatarFile);
     syncActivePersonaAvatarMode(settings.useActiveUserPersonaAvatar);
+    renderAdditionalReferencesList();
     updateVisibility();
 }
 
