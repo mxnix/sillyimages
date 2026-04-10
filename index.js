@@ -6,6 +6,24 @@
  */
 
 const MODULE_NAME = 'inline_image_gen';
+const OPENAI_IMAGE_GENERATION_ENDPOINT = '/v1/images/generations';
+const OPENAI_CHAT_COMPLETIONS_ENDPOINT = '/v1/chat/completions';
+const OPENAI_RESPONSES_ENDPOINT = '/v1/responses';
+const VALID_OPENAI_IMAGE_SIZES = Object.freeze([
+    '256x256',
+    '512x512',
+    '1024x1024',
+    '1536x1024',
+    '1024x1536',
+    '2048x2048',
+    '4096x4096',
+    'auto',
+]);
+const OPENAI_SIZE_BY_ASPECT_RATIO = Object.freeze({
+    '1:1': '1024x1024',
+    '16:9': '1536x1024',
+    '9:16': '1024x1536',
+});
 
 // Track messages currently being processed to prevent duplicate processing
 const processingMessages = new Set();
@@ -13,6 +31,7 @@ const processingMessages = new Set();
 // Log buffer for debugging
 const logBuffer = [];
 const MAX_LOG_ENTRIES = 200;
+const modelInfoCache = new Map();
 
 function iigLog(level, ...args) {
     const timestamp = new Date().toISOString();
@@ -126,7 +145,7 @@ function isImageModel(modelId) {
 }
 
 /**
- * Check if model is Gemini/nano-banana type
+ * Check if model uses the raw Gemini generateContent API path
  */
 function isGeminiModel(modelId) {
     const mid = modelId.toLowerCase();
@@ -224,6 +243,249 @@ function getEffectiveEndpoint(settings = getSettings()) {
     return normalizeConfiguredEndpoint(settings.apiType, settings.endpoint);
 }
 
+function getRequestHeaders(apiKey, extraHeaders = {}) {
+    const headers = { ...extraHeaders };
+    if (apiKey) {
+        headers.Authorization = `Bearer ${apiKey}`;
+    }
+    return headers;
+}
+
+function getModelInfoCacheKey(endpoint, modelId) {
+    return `${endpoint}::${modelId}`;
+}
+
+function modelSupportsEndpoint(modelInfo, endpointPath) {
+    return Array.isArray(modelInfo?.endpoints) && modelInfo.endpoints.includes(endpointPath);
+}
+
+async function fetchModelInfo(modelId, settings = getSettings()) {
+    const endpoint = getEffectiveEndpoint(settings);
+    if (!endpoint || !modelId || settings.apiType === 'naistera') {
+        return null;
+    }
+
+    const cacheKey = getModelInfoCacheKey(endpoint, modelId);
+    if (modelInfoCache.has(cacheKey)) {
+        return modelInfoCache.get(cacheKey);
+    }
+
+    const request = (async () => {
+        try {
+            const response = await fetch(`${endpoint}/v1/models/${encodeURIComponent(modelId)}`, {
+                method: 'GET',
+                headers: getRequestHeaders(settings.apiKey),
+            });
+
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+
+            return await response.json();
+        } catch (error) {
+            iigLog('WARN', `Unable to fetch model info for ${modelId}: ${error.message}`);
+            return null;
+        }
+    })();
+
+    modelInfoCache.set(cacheKey, request);
+    return request;
+}
+
+function normalizeOpenAIImageSize(size) {
+    if (size === '1792x1024') return '1536x1024';
+    if (size === '1024x1792') return '1024x1536';
+    return VALID_OPENAI_IMAGE_SIZES.includes(size) ? size : '1024x1024';
+}
+
+function getOpenAIImageSize(options = {}, settings = getSettings()) {
+    if (options.aspectRatio && OPENAI_SIZE_BY_ASPECT_RATIO[options.aspectRatio]) {
+        return OPENAI_SIZE_BY_ASPECT_RATIO[options.aspectRatio];
+    }
+    return normalizeOpenAIImageSize(options.size || settings.size || '1024x1024');
+}
+
+function normalizeResponsesImageQuality(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (!normalized) return null;
+    if (normalized === 'hd') return 'high';
+    if (normalized === 'standard') return 'medium';
+    if (['low', 'medium', 'high', 'auto'].includes(normalized)) return normalized;
+    return null;
+}
+
+function getImageMimeTypeFromFormat(outputFormat) {
+    const format = String(outputFormat || '').trim().toLowerCase();
+    if (!format || format === 'png') return 'image/png';
+    if (format === 'jpg') return 'image/jpeg';
+    return `image/${format}`;
+}
+
+function createApiError(status, text, variant = '') {
+    const error = new Error(`API Error (${status}): ${text}`);
+    error.status = status;
+    error.responseText = text;
+    error.variant = variant;
+    return error;
+}
+
+function shouldRetryResponsesVariant(status) {
+    return ![401, 403, 404, 429].includes(status);
+}
+
+function tryParseJsonValue(value) {
+    if (typeof value !== 'string') return null;
+
+    try {
+        return JSON.parse(value);
+    } catch {
+        return null;
+    }
+}
+
+function extractApiValidationIssues(value) {
+    const queue = [value];
+    const issues = [];
+    const seenStrings = new Set();
+    const seenObjects = new WeakSet();
+
+    while (queue.length > 0) {
+        const current = queue.shift();
+        if (!current) continue;
+
+        if (typeof current === 'string') {
+            const trimmed = current.trim();
+            if (!trimmed || seenStrings.has(trimmed)) continue;
+            seenStrings.add(trimmed);
+
+            const parsed = tryParseJsonValue(trimmed);
+            if (parsed !== null) {
+                queue.push(parsed);
+            }
+            continue;
+        }
+
+        if (typeof current !== 'object') {
+            continue;
+        }
+
+        if (seenObjects.has(current)) {
+            continue;
+        }
+        seenObjects.add(current);
+
+        if (Array.isArray(current)) {
+            queue.push(...current);
+            continue;
+        }
+
+        if (Array.isArray(current.path) && Array.isArray(current.values)) {
+            issues.push(current);
+        }
+
+        queue.push(...Object.values(current));
+    }
+
+    return issues;
+}
+
+function extractAllowedValuesForApiField(error, fieldName) {
+    const issues = extractApiValidationIssues(error?.responseText || error?.message || error);
+    const normalizedField = String(fieldName || '').trim();
+    const values = [];
+
+    for (const issue of issues) {
+        const path = Array.isArray(issue?.path) ? issue.path.map((item) => String(item)) : [];
+        if (!path.includes(normalizedField)) {
+            continue;
+        }
+
+        for (const value of Array.isArray(issue?.values) ? issue.values : []) {
+            values.push(String(value));
+        }
+    }
+
+    return [...new Set(values)];
+}
+
+function hasApiValidationIssueForField(error, fieldName) {
+    return extractAllowedValuesForApiField(error, fieldName).length > 0;
+}
+
+function pickOpenAIImageSizeFallback(allowedValues, requestedSize, settings = getSettings()) {
+    const normalizedAllowed = [...new Set(
+        (Array.isArray(allowedValues) ? allowedValues : [])
+            .map((value) => String(value))
+            .filter((value) => VALID_OPENAI_IMAGE_SIZES.includes(value))
+    )];
+
+    if (normalizedAllowed.length === 0) {
+        return null;
+    }
+
+    const preferred = [
+        'auto',
+        normalizeOpenAIImageSize(settings.size),
+        '1024x1024',
+        '1536x1024',
+        '1024x1536',
+        '512x512',
+        '256x256',
+        '2048x2048',
+        '4096x4096',
+        ...VALID_OPENAI_IMAGE_SIZES,
+    ];
+
+    return preferred.find((size) => size !== requestedSize && normalizedAllowed.includes(size))
+        || normalizedAllowed.find((size) => size !== requestedSize)
+        || null;
+}
+
+async function postJson(url, body, settings, variant = '') {
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: getRequestHeaders(settings.apiKey, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+        const text = await response.text();
+        throw createApiError(response.status, text, variant);
+    }
+
+    return await response.json();
+}
+
+async function resolveImageGenerationRoute(settings = getSettings()) {
+    if (settings.apiType === 'naistera') return 'naistera';
+
+    const modelInfo = await fetchModelInfo(settings.model, settings);
+    if (settings.apiType === 'gemini') {
+        if (modelSupportsEndpoint(modelInfo, OPENAI_IMAGE_GENERATION_ENDPOINT)) {
+            return 'openai';
+        }
+        if (modelSupportsEndpoint(modelInfo, OPENAI_CHAT_COMPLETIONS_ENDPOINT) && isImageModel(settings.model)) {
+            return 'chat_image';
+        }
+        if (modelSupportsEndpoint(modelInfo, OPENAI_RESPONSES_ENDPOINT) && isImageModel(settings.model)) {
+            return 'responses';
+        }
+        return 'gemini';
+    }
+
+    if (modelSupportsEndpoint(modelInfo, OPENAI_IMAGE_GENERATION_ENDPOINT)) {
+        return 'openai';
+    }
+    if (modelSupportsEndpoint(modelInfo, OPENAI_CHAT_COMPLETIONS_ENDPOINT) && isImageModel(settings.model)) {
+        return 'chat_image';
+    }
+    if (modelSupportsEndpoint(modelInfo, OPENAI_RESPONSES_ENDPOINT) && isImageModel(settings.model)) {
+        return 'responses';
+    }
+
+    return 'openai';
+}
+
 /**
  * Get extension settings
  */
@@ -240,6 +502,10 @@ function getSettings() {
             context.extensionSettings[MODULE_NAME][key] = defaultSettings[key];
         }
     }
+
+    context.extensionSettings[MODULE_NAME].size = normalizeOpenAIImageSize(
+        context.extensionSettings[MODULE_NAME].size
+    );
     
     return context.extensionSettings[MODULE_NAME];
 }
@@ -555,8 +821,8 @@ async function fetchModels() {
     const settings = getSettings();
     const endpoint = getEffectiveEndpoint(settings);
     
-    if (!endpoint || !settings.apiKey) {
-        console.warn('[IIG] Cannot fetch models: endpoint or API key not set');
+    if (!endpoint) {
+        console.warn('[IIG] Cannot fetch models: endpoint not set');
         return [];
     }
     
@@ -575,10 +841,21 @@ async function fetchModels() {
         }
         
         const data = await response.json();
-        const models = data.data || [];
-        
-        // Filter for image models only
-        return models.filter(m => isImageModel(m.id)).map(m => m.id);
+        const models = (data.data || []).filter((m) => isImageModel(m.id));
+        const withCapabilities = await Promise.all(models.map(async (model) => ({
+            id: model.id,
+            info: await fetchModelInfo(model.id, settings),
+        })));
+
+        return withCapabilities
+            .filter(({ id, info }) => {
+                if (!info) return true;
+                return modelSupportsEndpoint(info, OPENAI_IMAGE_GENERATION_ENDPOINT)
+                    || modelSupportsEndpoint(info, OPENAI_CHAT_COMPLETIONS_ENDPOINT)
+                    || modelSupportsEndpoint(info, OPENAI_RESPONSES_ENDPOINT)
+                    || (settings.apiType === 'gemini' && isGeminiModel(id));
+            })
+            .map(({ id }) => id);
     } catch (error) {
         console.error('[IIG] Failed to fetch models:', error);
         toastr.error(`Ошибка загрузки моделей: ${error.message}`, 'Генерация картинок');
@@ -1091,65 +1368,357 @@ async function getUserAvatarBase64() {
  */
 async function generateImageOpenAI(prompt, style, referenceImages = [], options = {}) {
     const settings = getSettings();
-    const url = `${settings.endpoint.replace(/\/$/, '')}/v1/images/generations`;
-    
-    // Combine style and prompt
+    const endpoint = getEffectiveEndpoint(settings);
+    const url = `${endpoint}/v1/images/generations`;
+
     const fullPrompt = style ? `[Style: ${style}] ${prompt}` : prompt;
-    
-    // Map aspect ratio to size if provided in tag
-    let size = settings.size;
-    if (options.aspectRatio) {
-        if (options.aspectRatio === '16:9') size = '1792x1024';
-        else if (options.aspectRatio === '9:16') size = '1024x1792';
-        else if (options.aspectRatio === '1:1') size = '1024x1024';
+    const requestedSize = getOpenAIImageSize(options, settings);
+    const requestedQuality = String(options.quality || settings.quality || '').trim();
+    const variants = [];
+    const seenVariants = new Set();
+    const errors = [];
+
+    const enqueueVariant = (name, config = {}) => {
+        const variant = {
+            name,
+            includeSize: config.includeSize ?? true,
+            size: config.size ?? requestedSize,
+            includeQuality: config.includeQuality ?? Boolean(requestedQuality),
+            quality: config.quality ?? requestedQuality,
+        };
+        const signature = JSON.stringify({
+            size: variant.includeSize ? variant.size : null,
+            quality: variant.includeQuality ? variant.quality : null,
+        });
+
+        if (seenVariants.has(signature)) {
+            return;
+        }
+
+        seenVariants.add(signature);
+        variants.push(variant);
+    };
+
+    const buildRequestBody = (variant) => {
+        const body = {
+            model: settings.model,
+            prompt: fullPrompt,
+            n: 1,
+            response_format: 'b64_json',
+        };
+
+        if (variant.includeSize) {
+            body.size = variant.size;
+        }
+        if (variant.includeQuality && variant.quality) {
+            body.quality = variant.quality;
+        }
+        if (referenceImages.length > 0) {
+            body.image = `data:image/png;base64,${referenceImages[0]}`;
+        }
+
+        return body;
+    };
+
+    const extractImageResult = (result) => {
+        const dataList = Array.isArray(result?.data) ? result.data : [];
+        if (dataList.length === 0) {
+            if (result?.url) return result.url;
+            throw new Error('No image data in response');
+        }
+
+        const imageObj = dataList[0] || {};
+        if (imageObj.b64_json) {
+            return `data:image/png;base64,${imageObj.b64_json}`;
+        }
+        if (imageObj.url) {
+            return imageObj.url;
+        }
+
+        throw new Error('No image data in response');
+    };
+
+    enqueueVariant('images-configured');
+
+    for (let index = 0; index < variants.length; index++) {
+        const variant = variants[index];
+
+        iigLog(
+            'INFO',
+            `OpenAI image request: variant=${variant.name} model=${settings.model} size=${variant.includeSize ? variant.size : 'default'} quality=${variant.includeQuality ? variant.quality || 'default' : 'default'} promptLength=${fullPrompt.length} refImages=${referenceImages.length}`
+        );
+
+        try {
+            const result = await postJson(url, buildRequestBody(variant), settings, variant.name);
+            return extractImageResult(result);
+        } catch (error) {
+            const status = Number(error?.status || 0);
+            const text = String(error?.responseText || error?.message || error);
+            errors.push(`variant=${variant.name}: ${status || 'error'} ${text}`);
+            iigLog('WARN', `OpenAI image variant failed: ${variant.name} status=${status || 'n/a'} ${text}`);
+
+            const canRetryVariant = ![401, 403, 404, 429].includes(status);
+            if (!canRetryVariant) {
+                break;
+            }
+
+            const sizeIssue = hasApiValidationIssueForField(error, 'size');
+            const qualityIssue = hasApiValidationIssueForField(error, 'quality');
+
+            if ((status === 400 || status === 422 || sizeIssue) && variant.includeSize) {
+                const allowedSizes = extractAllowedValuesForApiField(error, 'size');
+                const fallbackSize = pickOpenAIImageSizeFallback(allowedSizes, variant.size, settings);
+                if (fallbackSize) {
+                    enqueueVariant(`${variant.name}-fallback-size-${fallbackSize}`, {
+                        ...variant,
+                        size: fallbackSize,
+                    });
+                }
+                if (variant.size !== 'auto') {
+                    enqueueVariant(`${variant.name}-auto-size`, {
+                        ...variant,
+                        size: 'auto',
+                    });
+                }
+                enqueueVariant(`${variant.name}-omit-size`, {
+                    ...variant,
+                    includeSize: false,
+                });
+            }
+
+            if ((status === 400 || status === 422 || qualityIssue) && variant.includeQuality) {
+                enqueueVariant(`${variant.name}-omit-quality`, {
+                    ...variant,
+                    includeQuality: false,
+                });
+            }
+
+            if (index < variants.length - 1) {
+                continue;
+            }
+
+            break;
+        }
     }
-    
+
+    throw new Error(`OpenAI image generation failed. Attempts: ${errors.join(' | ')}`);
+}
+
+async function generateImageChatCompletions(prompt, style, referenceImages = [], options = {}) {
+    const settings = getSettings();
+    const endpoint = getEffectiveEndpoint(settings);
+    const url = `${endpoint}${OPENAI_CHAT_COMPLETIONS_ENDPOINT}`;
+
+    let fullPrompt = style ? `[Style: ${style}] ${prompt}` : prompt;
+    if (referenceImages.length > 0) {
+        const refInstruction = '[CRITICAL: Use the attached reference image(s) to preserve the same character appearance, face, hair, clothing, and overall identity unless the prompt explicitly asks for a change.]';
+        fullPrompt = `${refInstruction}\n\n${fullPrompt}`;
+    }
+
+    let content = fullPrompt;
+    if (referenceImages.length > 0) {
+        content = [{
+            type: 'text',
+            text: fullPrompt,
+        }];
+
+        for (const imgB64 of referenceImages.slice(0, MAX_GENERATION_REFERENCE_IMAGES)) {
+            content.push({
+                type: 'image_url',
+                image_url: {
+                    url: `data:image/png;base64,${imgB64}`,
+                },
+            });
+        }
+    }
+
     const body = {
         model: settings.model,
-        prompt: fullPrompt,
-        n: 1,
-        size: size,
-        quality: options.quality || settings.quality,
-        response_format: 'b64_json'
+        messages: [{
+            role: 'user',
+            content,
+        }],
     };
-    
-    // Add reference image if supported (for models like GPT-Image-1, FLUX)
+
+    iigLog(
+        'INFO',
+        `Chat image request: model=${settings.model} promptLength=${fullPrompt.length} refImages=${referenceImages.length}`
+    );
+
+    const result = await postJson(url, body, settings, 'chat-image');
+    const choice = Array.isArray(result.choices) ? result.choices[0] : null;
+    const message = choice?.message;
+
+    const images = Array.isArray(message?.images) ? message.images : [];
+    for (const image of images) {
+        const imageUrl = image?.image_url?.url;
+        if (typeof imageUrl === 'string' && imageUrl) {
+            return imageUrl;
+        }
+    }
+
+    const contentParts = Array.isArray(message?.content) ? message.content : [];
+    for (const part of contentParts) {
+        if (part?.type === 'output_image' && part.image_url?.url) {
+            return part.image_url.url;
+        }
+    }
+
+    const messageText = typeof message?.content === 'string'
+        ? message.content
+        : contentParts
+            .filter((part) => part?.type === 'output_text' && typeof part.text === 'string')
+            .map((part) => part.text)
+            .join('\n')
+            .trim();
+
+    throw new Error(`No image found in chat completion response${messageText ? `; model said: ${messageText}` : ''}`);
+}
+
+async function generateImageResponses(prompt, style, referenceImages = [], options = {}) {
+    const settings = getSettings();
+    const endpoint = getEffectiveEndpoint(settings);
+    const url = `${endpoint}${OPENAI_RESPONSES_ENDPOINT}`;
+    const requestedQuality = normalizeResponsesImageQuality(options.quality || settings.quality);
+    const requestedSize = getOpenAIImageSize(options, settings);
+
+    let fullPrompt = style ? `[Style: ${style}] ${prompt}` : prompt;
     if (referenceImages.length > 0) {
-        body.image = `data:image/png;base64,${referenceImages[0]}`;
+        const refInstruction = '[CRITICAL: Use the attached reference image(s) to preserve the same character appearance, face, hair, clothing, and overall identity unless the prompt explicitly asks for a change.]';
+        fullPrompt = `${refInstruction}\n\n${fullPrompt}`;
     }
-    
-    const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${settings.apiKey}`,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(body)
+
+    const tool = {
+        type: 'image_generation',
+    };
+
+    if (requestedSize !== 'auto') {
+        tool.size = requestedSize;
+    }
+    if (requestedQuality && requestedQuality !== 'auto') {
+        tool.quality = requestedQuality;
+    }
+
+    const minimalTool = { type: 'image_generation' };
+    const structuredContent = referenceImages
+        .slice(0, MAX_GENERATION_REFERENCE_IMAGES)
+        .map((imgB64) => ({
+            type: 'input_image',
+            image_url: `data:image/png;base64,${imgB64}`,
+        }));
+    structuredContent.push({
+        type: 'input_text',
+        text: fullPrompt,
     });
-    
-    if (!response.ok) {
-        const text = await response.text();
-        throw new Error(`API Error (${response.status}): ${text}`);
+
+    const variants = [];
+    const pushVariant = (name, body) => variants.push({ name, body });
+
+    if (referenceImages.length > 0) {
+        pushVariant('responses-structured-refs-minimal', {
+            model: settings.model,
+            input: [{
+                role: 'user',
+                content: structuredContent,
+            }],
+            tools: [minimalTool],
+        });
+
+        if (JSON.stringify(tool) !== JSON.stringify(minimalTool)) {
+            pushVariant('responses-structured-refs-configured', {
+                model: settings.model,
+                input: [{
+                    role: 'user',
+                    content: structuredContent,
+                }],
+                tools: [tool],
+            });
+        }
     }
-    
-    const result = await response.json();
-    
-    // Parse response - standard OpenAI format
-    const dataList = result.data || [];
-    if (dataList.length === 0) {
-        if (result.url) return result.url;
-        throw new Error('No image data in response');
+
+    pushVariant('responses-string-minimal', {
+        model: settings.model,
+        input: fullPrompt,
+        tools: [minimalTool],
+    });
+
+    if (JSON.stringify(tool) !== JSON.stringify(minimalTool)) {
+        pushVariant('responses-string-configured', {
+            model: settings.model,
+            input: fullPrompt,
+            tools: [tool],
+        });
     }
-    
-    const imageObj = dataList[0];
-    const imageData = imageObj.b64_json || imageObj.url;
-    
-    // Return as data URL if b64_json
-    if (imageObj.b64_json) {
-        return `data:image/png;base64,${imageObj.b64_json}`;
+
+    pushVariant('responses-structured-text-minimal', {
+        model: settings.model,
+        input: [{
+            role: 'user',
+            content: [{
+                type: 'input_text',
+                text: fullPrompt,
+            }],
+        }],
+        tools: [minimalTool],
+    });
+
+    if (JSON.stringify(tool) !== JSON.stringify(minimalTool)) {
+        pushVariant('responses-structured-text-configured', {
+            model: settings.model,
+            input: [{
+                role: 'user',
+                content: [{
+                    type: 'input_text',
+                    text: fullPrompt,
+                }],
+            }],
+            tools: [tool],
+        });
     }
-    
-    return imageData;
+
+    const errors = [];
+
+    for (let index = 0; index < variants.length; index++) {
+        const variant = variants[index];
+
+        iigLog(
+            'INFO',
+            `Responses image request: variant=${variant.name} model=${settings.model} size=${requestedSize} quality=${requestedQuality || 'default'} promptLength=${fullPrompt.length} refImages=${referenceImages.length}`
+        );
+
+        try {
+            const result = await postJson(url, variant.body, settings, variant.name);
+            const output = Array.isArray(result.output) ? result.output : [];
+
+            for (const item of output) {
+                if (item?.type === 'image_generation_call' && item.result) {
+                    return `data:${getImageMimeTypeFromFormat(item.output_format)};base64,${item.result}`;
+                }
+
+                const contentItems = Array.isArray(item?.content) ? item.content : [];
+                for (const part of contentItems) {
+                    if (part?.type === 'output_image' && part.image_base64) {
+                        return `data:${getImageMimeTypeFromFormat(part.output_format)};base64,${part.image_base64}`;
+                    }
+                }
+            }
+
+            errors.push(`variant=${variant.name}: no image in output`);
+        } catch (error) {
+            const status = Number(error?.status || 0);
+            const text = String(error?.responseText || error?.message || error);
+            errors.push(`variant=${variant.name}: ${status || 'error'} ${text}`);
+            iigLog('WARN', `Responses variant failed: ${variant.name} status=${status || 'n/a'} ${text}`);
+
+            if (index < variants.length - 1 && shouldRetryResponsesVariant(status)) {
+                continue;
+            }
+
+            break;
+        }
+    }
+
+    throw new Error(`Responses image generation failed. Attempts: ${errors.join(' | ')}`);
 }
 
 // Valid aspect ratios for Gemini/nano-banana
@@ -1163,7 +1732,8 @@ const VALID_IMAGE_SIZES = ['1K', '2K', '4K'];
 async function generateImageGemini(prompt, style, referenceImages = [], options = {}) {
     const settings = getSettings();
     const model = settings.model;
-    const url = `${settings.endpoint.replace(/\/$/, '')}/v1beta/models/${model}:generateContent`;
+    const endpoint = getEffectiveEndpoint(settings);
+    const url = `${endpoint}/v1beta/models/${model}:generateContent`;
     
     // Determine aspect ratio: tag option > settings, with validation
     let aspectRatio = options.aspectRatio || settings.aspectRatio || '1:1';
@@ -1226,10 +1796,7 @@ async function generateImageGemini(prompt, style, referenceImages = [], options 
     
     const response = await fetch(url, {
         method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${settings.apiKey}`,
-            'Content-Type': 'application/json'
-        },
+        headers: getRequestHeaders(settings.apiKey, { 'Content-Type': 'application/json' }),
         body: JSON.stringify(body)
     });
     
@@ -1721,16 +2288,22 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
         try {
             onStatusUpdate?.(`Генерация${attempt > 0 ? ` (повтор ${attempt}/${maxRetries})` : ''}...`);
             let generated;
-            // Choose API based on type or model
-            if (settings.apiType === 'naistera') {
+            const route = await resolveImageGenerationRoute(settings);
+            iigLog('INFO', `Resolved generation route: apiType=${settings.apiType} model=${settings.model} route=${route}`);
+
+            if (route === 'naistera') {
                 generated = await generateImageNaistera(prompt, style, {
                     ...options,
                     referenceImages: referenceDataUrls,
                     videoTestMode: enableVideoTest,
                     videoEveryN: settings.naisteraVideoEveryN,
                 });
-            } else if (settings.apiType === 'gemini' || isGeminiModel(settings.model)) {
+            } else if (route === 'chat_image') {
+                generated = await generateImageChatCompletions(prompt, style, referenceImages, options);
+            } else if (route === 'gemini') {
                 generated = await generateImageGemini(prompt, style, referenceImages, options);
+            } else if (route === 'responses') {
+                generated = await generateImageResponses(prompt, style, referenceImages, options);
             } else {
                 generated = await generateImageOpenAI(prompt, style, referenceImages, options);
             }
@@ -2702,10 +3275,14 @@ function createSettingsUI() {
                         <div class="flex-row ${settings.apiType !== 'openai' ? 'iig-hidden' : ''}" id="iig_size_row">
                             <label for="iig_size">Размер</label>
                             <select id="iig_size" class="flex1">
+                                <option value="auto" ${settings.size === 'auto' ? 'selected' : ''}>auto (на усмотрение модели)</option>
+                                <option value="4096x4096" ${settings.size === '4096x4096' ? 'selected' : ''}>4096x4096 (4K квадрат)</option>
+                                <option value="2048x2048" ${settings.size === '2048x2048' ? 'selected' : ''}>2048x2048 (Большой квадрат)</option>
                                 <option value="1024x1024" ${settings.size === '1024x1024' ? 'selected' : ''}>1024x1024 (Квадрат)</option>
-                                <option value="1792x1024" ${settings.size === '1792x1024' ? 'selected' : ''}>1792x1024 (Альбомная)</option>
-                                <option value="1024x1792" ${settings.size === '1024x1792' ? 'selected' : ''}>1024x1792 (Портретная)</option>
+                                <option value="1536x1024" ${settings.size === '1536x1024' ? 'selected' : ''}>1536x1024 (Альбомная)</option>
+                                <option value="1024x1536" ${settings.size === '1024x1536' ? 'selected' : ''}>1024x1536 (Портретная)</option>
                                 <option value="512x512" ${settings.size === '512x512' ? 'selected' : ''}>512x512 (Маленький)</option>
+                                <option value="256x256" ${settings.size === '256x256' ? 'selected' : ''}>256x256 (Мини)</option>
                             </select>
                         </div>
 
